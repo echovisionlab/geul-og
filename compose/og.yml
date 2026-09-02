@@ -1,0 +1,27 @@
+name: geul-og
+
+services:
+  geul-og:
+    image: ${GEUL_OG_IMAGE:?set GEUL_OG_IMAGE to a full image reference}
+    container_name: geul-og-prod
+    environment:
+      PORT: 3010
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${GEUL_OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_EXPORTER_OTLP_PROTOCOL: ${GEUL_OTEL_EXPORTER_OTLP_PROTOCOL:-http/protobuf}
+      OTEL_RESOURCE_ATTRIBUTES: ${GEUL_OTEL_RESOURCE_ATTRIBUTES:-service.namespace=geul,deployment.environment=production,service.name=geul-og}
+      DATABASE_DSN: ${GEUL_OG_DATABASE_DSN:?set GEUL_OG_DATABASE_DSN}
+      OG_SHUTDOWN_TIMEOUT_MS: 120000
+      S3_ENDPOINT: ${GEUL_OG_S3_ENDPOINT:?set GEUL_OG_S3_ENDPOINT}
+      S3_MEDIA_BUCKET: ${GEUL_S3_MEDIA_BUCKET:?set GEUL_S3_MEDIA_BUCKET}
+      S3_REGION: ${GEUL_S3_REGION:-us-east-1}
+      S3_ACCESS_KEY_ID: ${GEUL_OG_S3_ACCESS_KEY_ID:?set GEUL_OG_S3_ACCESS_KEY_ID}
+      S3_SECRET_ACCESS_KEY: ${GEUL_OG_S3_SECRET_ACCESS_KEY:?set GEUL_OG_S3_SECRET_ACCESS_KEY}
+      BACKEND_URL: ${GEUL_OG_BACKEND_URL:?set GEUL_OG_BACKEND_URL}
+      TOKEN_SIGNING_SECRET: ${GEUL_BACKEND_TOKEN_SIGNING_SECRET:?set GEUL_BACKEND_TOKEN_SIGNING_SECRET}
+    restart: unless-stopped
+    stop_grace_period: 130s
+    healthcheck:
+      test: ['CMD-SHELL', 'wget --spider -q http://127.0.0.1:3010/health']
+      interval: 30s
+      timeout: 3s
+      retries: 3

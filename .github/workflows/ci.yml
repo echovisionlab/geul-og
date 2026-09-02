@@ -1,0 +1,149 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PNPM_VERSION: 11.22.0
+  NODE_VERSION: 24.19.0
+
+jobs:
+  validate:
+    name: Validate
+    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          clean: true
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Dead code
+        run: pnpm check:dead-code
+
+      - name: Check CI script syntax
+        run: pnpm check:ci-script-syntax
+
+      - name: Test CI scripts and runtime configuration
+        run: pnpm test:ci-scripts
+
+      - name: Test coverage
+        run: pnpm test:coverage
+
+      - name: Start isolated MinIO
+        id: minio
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="geul-og-minio-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RANDOM}"
+          docker run -d --name "$name" -p 127.0.0.1::9000 \
+            -e MINIO_ROOT_USER=geultest \
+            -e MINIO_ROOT_PASSWORD=geultestsecret \
+            minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
+            server /data
+          echo "container=$name" >> "$GITHUB_OUTPUT"
+          port="$(docker port "$name" 9000/tcp | sed -E 's/.*:([0-9]+)$/\1/')"
+          echo "endpoint=http://127.0.0.1:$port" >> "$GITHUB_OUTPUT"
+          for _ in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:$port/minio/health/ready" >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs "$name"
+          exit 1
+
+      - name: Test MinIO replay safety
+        env:
+          OG_S3_INTEGRATION_ENDPOINT: ${{ steps.minio.outputs.endpoint }}
+          OG_S3_INTEGRATION_ACCESS_KEY: geultest
+          OG_S3_INTEGRATION_SECRET_KEY: geultestsecret
+        run: pnpm test:integration
+
+      - name: Stop isolated MinIO
+        if: always() && steps.minio.outputs.container != ''
+        run: docker rm -f "${{ steps.minio.outputs.container }}"
+
+      - name: Build
+        run: pnpm build
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build Docker image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: geul-og:ci
+
+      - name: Smoke Docker image
+        run: |
+          docker run --rm --platform linux/amd64 --entrypoint sh geul-og:ci -lc '
+            set -eu
+            test -s /app/dist/index.js
+            test -s /app/LICENSE.md
+            test -s /app/THIRD_PARTY_NOTICES.md
+            test -s /app/THIRD_PARTY_LICENSES/OFL-1.1-NotoSans.txt
+            test -s /app/THIRD_PARTY_LICENSES/OFL-1.1-Source.txt
+            test -s /app/assets/fonts/NotoSans-Regular.ttf
+            test -d /app/node_modules/sharp
+            test ! -e /app/node_modules/.bin/tsup
+            test "$(id -u)" -eq 1000
+            node --version
+          '
+
+  verify:
+    name: Verify required CI result
+    if: always()
+    needs: [validate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Verify validation result
+        env:
+          VALIDATE_RESULT: ${{ needs.validate.result }}
+        run: |
+          if [ "${VALIDATE_RESULT}" = "success" ] || [ "${VALIDATE_RESULT}" = "skipped" ]; then
+            exit 0
+          fi
+          echo "Validation result: ${VALIDATE_RESULT}" >&2
+          exit 1

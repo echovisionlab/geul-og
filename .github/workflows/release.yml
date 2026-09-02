@@ -1,0 +1,174 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: registry.dsub.io
+  IMAGE_NAME: registry.dsub.io/echovisionlab/geul-og
+  SERVICE_NAME: geul-og
+  PLATFORMS: linux/amd64
+
+jobs:
+  release-please:
+    name: Release Please
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+      sha: ${{ steps.release.outputs.sha }}
+
+    steps:
+      - name: Run Release Please
+        id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ github.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  publish-image:
+    name: Publish Image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+      RELEASE_VERSION: ${{ needs.release-please.outputs.version }}
+      RELEASE_SHA: ${{ needs.release-please.outputs.sha }}
+
+    steps:
+      - name: Check out the exact release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.release-please.outputs.tag_name }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Validate release outputs
+        id: release-context
+        run: |
+          set -euo pipefail
+          for var in RELEASE_TAG RELEASE_VERSION RELEASE_SHA; do
+            if [ -z "${!var:-}" ]; then
+              echo "Missing Release Please output: ${var}" >&2
+              exit 1
+            fi
+          done
+          if ! [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unsupported release tag format: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+          if ! [[ "${RELEASE_SHA}" =~ ^[a-f0-9]{40}$ ]]; then
+            echo "Unsupported release SHA format: ${RELEASE_SHA}" >&2
+            exit 1
+          fi
+          checkout_sha="$(git rev-parse HEAD)"
+          if [ "${checkout_sha}" != "${RELEASE_SHA}" ]; then
+            echo "Checked out ${checkout_sha}, expected release SHA ${RELEASE_SHA}." >&2
+            exit 1
+          fi
+          {
+            echo "created_at=$(git log -1 --format=%cI)"
+            echo "sha_image=${IMAGE_NAME}:sha-${RELEASE_SHA}"
+            echo "tag_image=${IMAGE_NAME}:${RELEASE_TAG}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Validate registry credentials
+        env:
+          HARBOR_REGISTRY_USERNAME: ${{ secrets.HARBOR_REGISTRY_USERNAME }}
+          HARBOR_REGISTRY_PASSWORD: ${{ secrets.HARBOR_REGISTRY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for var in HARBOR_REGISTRY_USERNAME HARBOR_REGISTRY_PASSWORD; do
+            if [ -z "${!var:-}" ]; then
+              echo "Missing secret: ${var}" >&2
+              exit 1
+            fi
+          done
+
+      - name: Log in to registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.HARBOR_REGISTRY_USERNAME }}
+          password: ${{ secrets.HARBOR_REGISTRY_PASSWORD }}
+
+      - name: Build and push release image
+        id: published-image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: |
+            ${{ steps.release-context.outputs.tag_image }}
+            ${{ steps.release-context.outputs.sha_image }}
+          labels: |
+            org.opencontainers.image.created=${{ steps.release-context.outputs.created_at }}
+            org.opencontainers.image.revision=${{ env.RELEASE_SHA }}
+            org.opencontainers.image.ref.name=${{ env.RELEASE_TAG }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.title=${{ env.SERVICE_NAME }}
+            org.opencontainers.image.version=${{ env.RELEASE_VERSION }}
+
+      - name: Verify release and SHA tag digests
+        env:
+          PUBLISHED_DIGEST: ${{ steps.published-image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          sha_digest="$(docker buildx imagetools inspect "${IMAGE_NAME}:sha-${RELEASE_SHA}" --format '{{.Manifest.Digest}}')"
+          tag_digest="$(docker buildx imagetools inspect "${IMAGE_NAME}:${RELEASE_TAG}" --format '{{.Manifest.Digest}}')"
+          if ! [[ "${PUBLISHED_DIGEST}" =~ ^sha256:[a-f0-9]{64}$ ]] ||
+             [ "${sha_digest}" != "${PUBLISHED_DIGEST}" ] ||
+             [ "${tag_digest}" != "${PUBLISHED_DIGEST}" ]; then
+            echo "Release and SHA tags do not identify the published image digest." >&2
+            exit 1
+          fi
+
+      - name: Validate and smoke immutable release image
+        env:
+          RELEASE_IMAGE: ${{ env.IMAGE_NAME }}@${{ steps.published-image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          expected_prefix="${IMAGE_NAME}@sha256:"
+          digest="${RELEASE_IMAGE#"${expected_prefix}"}"
+          if [ "${RELEASE_IMAGE}" != "${expected_prefix}${digest}" ] || ! [[ "${digest}" =~ ^[a-f0-9]{64}$ ]]; then
+            echo "Build output is not an immutable ${IMAGE_NAME}@sha256 digest." >&2
+            exit 1
+          fi
+
+          docker pull "${RELEASE_IMAGE}"
+
+          revision="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "${RELEASE_IMAGE}")"
+          ref_name="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.ref.name" }}' "${RELEASE_IMAGE}")"
+          source="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.source" }}' "${RELEASE_IMAGE}")"
+          version="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "${RELEASE_IMAGE}")"
+
+          [ "${revision}" = "${RELEASE_SHA}" ] || { echo "Image revision ${revision} does not match release SHA ${RELEASE_SHA}." >&2; exit 1; }
+          [ "${ref_name}" = "${RELEASE_TAG}" ] || { echo "Image ref label ${ref_name} does not match ${RELEASE_TAG}." >&2; exit 1; }
+          [ "${source}" = "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" ] || { echo "Image source ${source} does not match this repository." >&2; exit 1; }
+          [ "${version}" = "${RELEASE_VERSION}" ] || { echo "Image version ${version} does not match ${RELEASE_VERSION}." >&2; exit 1; }
+
+          docker run --rm "${RELEASE_IMAGE}" /bin/sh -c 'test -s /app/dist/index.js && test -s /app/LICENSE.md && test -s /app/THIRD_PARTY_NOTICES.md && test -s /app/THIRD_PARTY_LICENSES/OFL-1.1-NotoSans.txt && test -s /app/THIRD_PARTY_LICENSES/OFL-1.1-Source.txt && node --version >/dev/null'
