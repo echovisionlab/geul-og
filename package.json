@@ -1,6 +1,6 @@
 {
   "name": "@echovisionlab/geul-og",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "Geul OG image generation worker",
