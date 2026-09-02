@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.1](https://github.com/echovisionlab/geul-og/compare/v0.1.0...v0.1.1) (2026-09-02)
+
+
+### Bug Fixes
+
+* pin external container images by digest ([#3](https://github.com/echovisionlab/geul-og/issues/3)) ([644287a](https://github.com/echovisionlab/geul-og/commit/644287a32ce80e50f52466d6547ee42847ff1c16))
+
 ## 0.1.0 (2026-09-02)
 
 
